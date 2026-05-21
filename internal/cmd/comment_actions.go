@@ -17,15 +17,16 @@ import (
 )
 
 var (
-	replyMessage   string
-	replyThread    int
-	addFile        string
-	addLine        int
-	addMessage     string
-	addUnresolved  bool
-	addBatch       string
-	resolveThread  int
-	resolveMessage string
+	replyMessage    string
+	replyThread     int
+	addFile         string
+	addLine         int
+	addMessage      string
+	addUnresolved   bool
+	addBatch        string
+	resolveThread   int
+	resolveMessage  string
+	resolveBatch    string
 )
 
 // batchCommentInput is the JSON shape accepted by `comments add --batch`.
@@ -34,6 +35,12 @@ type batchCommentInput struct {
 	Line       int    `json:"line"`
 	Message    string `json:"message"`
 	Unresolved *bool  `json:"unresolved,omitempty"`
+}
+
+// batchResolveInput is the JSON shape accepted by `comments resolve --batch`.
+type batchResolveInput struct {
+	Thread  int    `json:"thread"`
+	Message string `json:"message,omitempty"`
 }
 
 var commentsReplyCmd = &cobra.Command{
@@ -78,10 +85,23 @@ var commentsResolveCmd = &cobra.Command{
 	Short: "Mark a comment thread as resolved",
 	Long: `Mark an unresolved comment thread as resolved.
 
+Use --batch to resolve many threads in a single REST call. The batch file is a
+JSON array of objects with fields: thread (index from gerry comments output),
+message (optional, defaults to "Done"). Pass "-" to read from stdin.
+
 Examples:
   gerry comments resolve 12345 -t 1
   gerry comments resolve 12345 -t 1 -m "Fixed in latest PS"
-  gerry comments resolve 12345   # interactive picker`,
+  gerry comments resolve 12345   # interactive picker
+  gerry comments resolve 12345 --batch resolves.json
+  cat resolves.json | gerry comments resolve 12345 --batch -
+
+Batch JSON shape:
+  [
+    {"thread": 1, "message": "Fixed in PS3"},
+    {"thread": 3, "message": "Done"},
+    {"thread": 5}
+  ]`,
 	Args: cobra.ExactArgs(1),
 	RunE: runCommentsResolve,
 }
@@ -110,6 +130,7 @@ func init() {
 
 	commentsResolveCmd.Flags().IntVarP(&resolveThread, "thread", "t", 0, "Thread index (from gerry comments output)")
 	commentsResolveCmd.Flags().StringVarP(&resolveMessage, "message", "m", "", "Optional message (default: \"Done\")")
+	commentsResolveCmd.Flags().StringVar(&resolveBatch, "batch", "", "Path to JSON file with multiple threads to resolve, or \"-\" for stdin")
 
 	commentsUnresolveCmd.Flags().IntVarP(&resolveThread, "thread", "t", 0, "Thread index (from gerry comments output)")
 	commentsUnresolveCmd.Flags().StringVarP(&resolveMessage, "message", "m", "", "Optional message")
@@ -342,6 +363,9 @@ func runCommentsAdd(cmd *cobra.Command, args []string) error {
 }
 
 func runCommentsResolve(cmd *cobra.Command, args []string) error {
+	if resolveBatch != "" {
+		return runResolveBatch(args)
+	}
 	return runResolveAction(args, true)
 }
 
@@ -485,6 +509,73 @@ func runCommentsAddBatch(client *gerrit.RESTClient, changeID, revision, source s
 
 	fmt.Printf("%s Posted %d comment(s) across %d file(s)\n",
 		utils.Green("✓"), len(inputs), len(comments))
+	return nil
+}
+
+func runResolveBatch(args []string) error {
+	changeID := args[0]
+	if err := utils.ValidateChangeID(changeID); err != nil {
+		return fmt.Errorf("invalid change ID: %w", err)
+	}
+
+	data, err := readBatchSource(resolveBatch)
+	if err != nil {
+		return err
+	}
+
+	var inputs []batchResolveInput
+	if err := json.Unmarshal(data, &inputs); err != nil {
+		return fmt.Errorf("failed to parse batch JSON: %w", err)
+	}
+	if len(inputs) == 0 {
+		return fmt.Errorf("batch contains no resolve entries")
+	}
+
+	cfg, client, err := loadConfigAndClient()
+	if err != nil {
+		return err
+	}
+
+	threads, err := getOrderedThreads(cfg, changeID, false)
+	if err != nil {
+		return err
+	}
+	if len(threads) == 0 {
+		fmt.Println("No unresolved comment threads found.")
+		return nil
+	}
+
+	revision, err := getCurrentRevision(client, changeID)
+	if err != nil {
+		return err
+	}
+
+	comments := make(map[string][]gerrit.ReviewComment)
+	for i, in := range inputs {
+		if in.Thread <= 0 || in.Thread > len(threads) {
+			return fmt.Errorf("batch entry %d: thread index %d out of range (1-%d)", i+1, in.Thread, len(threads))
+		}
+		thread := threads[in.Thread-1]
+		lastComment := thread[len(thread)-1]
+		if lastComment.ID == "" {
+			return fmt.Errorf("batch entry %d: cannot resolve thread %d: comment ID not available", i+1, in.Thread)
+		}
+		msg := in.Message
+		if msg == "" {
+			msg = "Done"
+		}
+		comments[lastComment.File] = append(comments[lastComment.File], gerrit.ReviewComment{
+			InReplyTo:  lastComment.ID,
+			Message:    msg,
+			Unresolved: boolPtr(false),
+		})
+	}
+
+	if err := client.PostReviewWithComments(changeID, revision, comments); err != nil {
+		return fmt.Errorf("failed to post batch resolves: %w", err)
+	}
+
+	fmt.Printf("%s Resolved %d thread(s)\n", utils.Green("✓"), len(inputs))
 	return nil
 }
 

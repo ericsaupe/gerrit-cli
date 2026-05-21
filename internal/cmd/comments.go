@@ -314,14 +314,36 @@ func displayThreads(threads [][]Comment) {
 }
 
 func buildCommentThreads(comments []Comment) [][]Comment {
-	threadMap := make(map[string][]Comment)
-
-	for _, comment := range comments {
-		threadKey := fmt.Sprintf("%s:%d", comment.File, comment.Line)
-		threadMap[threadKey] = append(threadMap[threadKey], comment)
+	byID := make(map[string]Comment, len(comments))
+	for _, c := range comments {
+		if c.ID != "" {
+			byID[c.ID] = c
+		}
 	}
 
-	threads := [][]Comment{}
+	findRootID := func(c Comment) string {
+		seen := make(map[string]bool)
+		for c.InReplyTo != "" && !seen[c.InReplyTo] {
+			seen[c.InReplyTo] = true
+			parent, ok := byID[c.InReplyTo]
+			if !ok {
+				break
+			}
+			c = parent
+		}
+		if c.ID != "" {
+			return c.ID
+		}
+		return fmt.Sprintf("%s:%d", c.File, c.Line)
+	}
+
+	threadMap := make(map[string][]Comment)
+	for _, c := range comments {
+		root := findRootID(c)
+		threadMap[root] = append(threadMap[root], c)
+	}
+
+	threads := make([][]Comment, 0, len(threadMap))
 	for _, thread := range threadMap {
 		sort.Slice(thread, func(i, j int) bool {
 			return thread[i].Updated < thread[j].Updated
